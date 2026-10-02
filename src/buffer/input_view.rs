@@ -1,13 +1,17 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::convert;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use data::buffer::{self, Upstream};
 use data::capabilities::{MultilineBatchKind, multiline_concat_lines};
-use data::config::buffer::text_input::{AutoFormat, Autocomplete, KeyBindings};
+use data::config::buffer::text_input::{
+    AutoFormat, Autocomplete, FontStyle, KeyBindings, Spellcheck,
+};
 use data::dashboard::BufferAction;
 use data::history::filter::FilterChain;
 use data::history::{self, ReadMarker};
@@ -21,6 +25,7 @@ use iced::Length::Fit;
 use iced::advanced::widget::Tree;
 use iced::advanced::{Layout, Shell, mouse};
 use iced::keyboard::{Key, key};
+use iced::widget::text::highlighter::{Style, Underline};
 use iced::widget::text::{self, Shaping, Wrapping};
 use iced::widget::{
     self, Space, button, center, column, container, mouse_area, operation, row,
@@ -45,6 +50,22 @@ use crate::{Theme, font, theme};
 
 mod completion;
 mod exec;
+
+// Platform spellchecker is not `Send`; keep one instance per UI thread.
+thread_local! {
+    static SPELL_CHECKER: RefCell<Option<SpellCheckerSlot>> =
+        const { RefCell::new(None) };
+}
+
+enum SpellCheckerSlot {
+    Ready {
+        locale: Option<String>,
+        checker: spellkit::Checker,
+    },
+    Failed {
+        locale: Option<String>,
+    },
+}
 
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(4);
 
@@ -213,6 +234,7 @@ fn paste_key_binding(
 
 pub fn view<'a>(
     state: &'a State,
+    clients: &'a data::client::Map,
     our_user: Option<&User>,
     channel_users: Option<&'a ChannelUsers>,
     server: &'a Server,
@@ -338,6 +360,21 @@ pub fn view<'a>(
                 _ => text_editor::Binding::from_key_press(key_press),
             }
         });
+
+    let chantypes = clients.get_server_chantypes_or_default(server);
+    let casemapping = clients.get_server_casemapping_or_default(server);
+    let own_nick = our_user.map(|user| user.nickname().to_owned());
+
+    let text_input = text_input.highlight_with::<SpellParser>(
+        config.buffer.text_input.spellcheck.clone(),
+        SpellHighlighter {
+            config: &config.buffer.text_input.spellcheck,
+            own_nick,
+            channel_users,
+            chantypes,
+            casemapping,
+        },
+    );
 
     let text_input = decorate(text_input).update(
         move |_state: &mut State,
@@ -713,6 +750,22 @@ pub struct State {
     upload_abort_handles: Vec<futures::future::AbortHandle>,
     draft_reply: Option<input::DraftReply>,
     reply_preview: Option<message::ReplyPreview>,
+    spell_suggestions: Option<SpellSuggestionSession>,
+}
+
+#[derive(Debug, Clone)]
+struct SpellError {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SpellSuggestionSession {
+    start: usize,
+    end: usize,
+    original: String,
+    suggestions: Vec<String>,
+    index: usize,
 }
 
 impl Default for State {
@@ -732,6 +785,7 @@ impl Default for State {
             upload_abort_handles: Vec::new(),
             draft_reply: None,
             reply_preview: None,
+            spell_suggestions: None,
         }
     }
 }
@@ -1059,6 +1113,9 @@ impl State {
                     }
                     result
                 } else {
+                    let _ = self.cycle_spell_suggestions(
+                        reverse, buffer, clients, history, config,
+                    );
                     (Task::none(), None)
                 }
             }
@@ -1518,6 +1575,7 @@ impl State {
 
                 match &action {
                     text_editor::Action::Edit(_) => {
+                        self.spell_suggestions = None;
                         self.parse_lines_and_maybe_send_typing_status(
                             buffer, clients, config,
                         );
@@ -2977,6 +3035,210 @@ fn upload_ghost(id: u32) -> String {
     }
 }
 
+fn is_spell_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '\''
+}
+
+fn spell_cursor_targets_range(
+    text: &str,
+    cursor: usize,
+    start: usize,
+    end: usize,
+) -> bool {
+    if cursor >= start && cursor <= end {
+        return true;
+    }
+    if cursor < end || end > text.len() || start > end {
+        return false;
+    }
+    text[end..cursor.min(text.len())]
+        .chars()
+        .all(|c| !is_spell_word_char(c))
+}
+
+fn line_index_to_byte(
+    content: &text_editor::Content,
+    line: usize,
+    index: usize,
+) -> usize {
+    let text = content.text();
+    let mut offset = 0;
+    for (i, current_line) in text.split('\n').enumerate() {
+        if i == line {
+            return offset + index.min(current_line.len());
+        }
+        offset += current_line.len() + 1;
+    }
+    text.len()
+}
+
+fn spell_error_for_cursor(
+    text: &str,
+    cursor: usize,
+    own_nick: Option<&Nick>,
+    channel_users: Option<&ChannelUsers>,
+    chantypes: &[char],
+    casemapping: data::isupport::CaseMap,
+) -> Option<SpellError> {
+    SPELL_CHECKER.with(|slot| {
+        let Some(SpellCheckerSlot::Ready { checker, .. }) = slot.borrow().as_ref()
+        else {
+            return None;
+        };
+
+        for error in checker.check(text) {
+            let range = error.range();
+            let word = &text[range.clone()];
+            if ignored_spell_token(
+                word,
+                own_nick,
+                channel_users,
+                chantypes,
+                casemapping,
+            ) {
+                continue;
+            }
+
+            if spell_cursor_targets_range(
+                text,
+                cursor,
+                range.start,
+                range.end,
+            ) {
+                return Some(SpellError {
+                    start: range.start,
+                    end: range.end,
+                });
+            }
+        }
+        None
+    })
+}
+
+impl State {
+    fn cycle_spell_suggestions(
+        &mut self,
+        reverse: bool,
+        buffer: &buffer::Upstream,
+        clients: &client::Map,
+        history: &mut history::Manager,
+        config: &Config,
+    ) -> bool {
+        if !config.buffer.text_input.spellcheck.enabled {
+            self.spell_suggestions = None;
+            return false;
+        }
+
+        let text = self.input_content.text();
+        let position = self.input_content.cursor().position;
+        let cursor_byte =
+            line_index_to_byte(&self.input_content, position.line, position.index);
+
+        let own_nick =
+            clients.nickname(buffer.server()).map(|nick| nick.to_owned());
+        let channel_users = buffer.channel().and_then(|channel| {
+            clients.get_channel_users(buffer.server(), channel)
+        });
+        let chantypes = clients.get_server_chantypes_or_default(buffer.server());
+        let casemapping =
+            clients.get_server_casemapping_or_default(buffer.server());
+
+        let in_session = self.spell_suggestions.as_ref().is_some_and(|session| {
+            spell_cursor_targets_range(
+                &text,
+                cursor_byte,
+                session.start,
+                session.end,
+            )
+        });
+
+        if !in_session {
+            let Some(error) = spell_error_for_cursor(
+                &text,
+                cursor_byte,
+                own_nick.as_ref(),
+                channel_users,
+                chantypes,
+                casemapping,
+            ) else {
+                self.spell_suggestions = None;
+                return false;
+            };
+
+            let original = text[error.start..error.end].to_string();
+            let suggestions = SPELL_CHECKER.with(|slot| {
+                match slot.borrow().as_ref() {
+                    Some(SpellCheckerSlot::Ready { checker, .. }) => {
+                        checker.suggest(&original)
+                    }
+                    _ => Vec::new(),
+                }
+            });
+
+            if suggestions.is_empty() {
+                self.spell_suggestions = None;
+                return false;
+            }
+
+            self.spell_suggestions = Some(SpellSuggestionSession {
+                start: error.start,
+                end: error.end,
+                original,
+                index: suggestions.len(),
+                suggestions,
+            });
+        }
+
+        let session = self.spell_suggestions.as_mut().unwrap();
+        let count = session.suggestions.len() + 1;
+        session.index = if reverse {
+            (session.index + count - 1) % count
+        } else {
+            (session.index + 1) % count
+        };
+
+        let replacement = if session.index < session.suggestions.len() {
+            session.suggestions[session.index].clone()
+        } else {
+            session.original.clone()
+        };
+
+        let start = session.start;
+        let end = session.end;
+        let old = &text[start..end];
+        let char_start =
+            UnicodeSegmentation::graphemes(&text[..start], true).count();
+        let char_len = UnicodeSegmentation::graphemes(old, true).count();
+        let replaced =
+            format!("{}{}{}", &text[..start], replacement, &text[end..]);
+        let delta = UnicodeSegmentation::graphemes(replacement.as_str(), true)
+            .count() as i64
+            - char_len as i64;
+
+        let cursor = adjust_cursor(
+            &self.input_content,
+            &replaced,
+            char_start,
+            char_len,
+            delta,
+        );
+        self.input_content = text_editor::Content::with_text(&replaced);
+        self.input_content.move_to(cursor);
+
+        if let Some(session) = self.spell_suggestions.as_mut() {
+            session.end = start + replacement.len();
+        }
+
+        history.record_draft(RawInput {
+            buffer: buffer.clone(),
+            text: self.input_content.text(),
+            reply: self.draft_reply.clone(),
+        });
+
+        true
+    }
+}
+
 /// Converts a `(line, col)` position to a flat char offset.
 ///
 /// `text_editor::Content` uses 2D positions, but offset arithmetic requires a
@@ -3191,6 +3453,192 @@ fn reset_undo_history(content: &mut text_editor::Content) {
 
     *content = text_editor::Content::with_text(&text);
     content.move_to(cursor);
+}
+
+struct SpellParser {
+    spellcheck: Spellcheck,
+    current_line: usize,
+}
+
+type ConfigCodeIterator<'a> =
+    Box<dyn Iterator<Item = (Range<usize>, String)> + 'a>;
+
+impl SpellParser {
+    fn new(spellcheck: &Spellcheck) -> Self {
+        Self {
+            current_line: 0,
+            spellcheck: spellcheck.clone(),
+        }
+    }
+
+    fn update(&mut self, spellcheck: &Spellcheck) {
+        self.current_line = 0;
+        self.spellcheck = spellcheck.clone();
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.current_line = line;
+    }
+
+    fn parse_line(&mut self, line: &str) -> ConfigCodeIterator<'_> {
+        let mut errors = vec![];
+
+        if !self.spellcheck.enabled {
+            return Box::new(errors.into_iter());
+        }
+
+        SPELL_CHECKER.with(|slot| {
+            {
+                let mut slot = slot.borrow_mut();
+                let needs_new = match slot.as_ref() {
+                    None => true,
+                    Some(SpellCheckerSlot::Ready {
+                        locale: cached, ..
+                    })
+                    | Some(SpellCheckerSlot::Failed { locale: cached }) => {
+                        cached != &self.spellcheck.locale
+                    }
+                };
+                if needs_new {
+                    let result = match self.spellcheck.locale.as_deref() {
+                        Some(locale) => spellkit::Checker::with_locale(locale),
+                        None => spellkit::Checker::new(),
+                    };
+                    match result {
+                        Ok(checker) => {
+                            *slot = Some(SpellCheckerSlot::Ready {
+                                locale: self.spellcheck.locale.clone(),
+                                checker,
+                            });
+                        }
+                        Err(err) => {
+                            log::warn!("spellcheck unavailable: {err}");
+                            *slot = Some(SpellCheckerSlot::Failed {
+                                locale: self.spellcheck.locale.clone(),
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+            let slot = slot.borrow();
+            let Some(SpellCheckerSlot::Ready { checker, .. }) = slot.as_ref()
+            else {
+                return;
+            };
+            for error in checker.check(line) {
+                errors.push((
+                    error.range(),
+                    token_context(line, error.range()).to_owned(),
+                ));
+            }
+        });
+
+        Box::new(errors.into_iter())
+    }
+
+    fn current_line(&self) -> usize {
+        self.current_line
+    }
+}
+
+impl text::Parser for SpellParser {
+    type Settings = Spellcheck;
+    type Output = String;
+    type Iterator<'a> = ConfigCodeIterator<'a>;
+
+    fn new(settings: &Self::Settings) -> Self {
+        Self::new(settings)
+    }
+
+    fn update(&mut self, new_settings: &Self::Settings) {
+        self.update(new_settings);
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.change_line(line);
+    }
+
+    fn parse_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        self.parse_line(line)
+    }
+
+    fn current_line(&self) -> usize {
+        self.current_line()
+    }
+}
+
+struct SpellHighlighter<'a> {
+    config: &'a Spellcheck,
+    own_nick: Option<Nick>,
+    channel_users: Option<&'a ChannelUsers>,
+    chantypes: &'a [char],
+    casemapping: data::isupport::CaseMap,
+}
+
+impl text::highlighter::Highlighter<String, Theme> for SpellHighlighter<'_> {
+    fn id(&self) -> &str {
+        "spellcheck"
+    }
+
+    fn highlight(&self, token: String, theme: &Theme) -> Style {
+        if ignored_spell_token(
+            &token,
+            self.own_nick.as_ref(),
+            self.channel_users,
+            self.chantypes,
+            self.casemapping,
+        ) {
+            Style::default()
+        } else {
+            spell_highlight(self.config, theme)
+        }
+    }
+}
+
+fn token_context(line: &str, range: Range<usize>) -> &str {
+    let separator = |c: char| c.is_whitespace() || c == ',';
+
+    let start = line[..range.start]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| separator(*c))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+
+    line[start..range.end].trim_end_matches(':')
+}
+
+fn ignored_spell_token(
+    token: &str,
+    own_nick: Option<&Nick>,
+    channel_users: Option<&ChannelUsers>,
+    chantypes: &[char],
+    casemapping: data::isupport::CaseMap,
+) -> bool {
+    if token.starts_with(chantypes) {
+        return true;
+    }
+
+    let nick = Nick::from_str(token, casemapping);
+    own_nick.is_some_and(|own_nick| own_nick == &nick)
+        || channel_users
+            .is_some_and(|users| users.get_by_nick(nick.as_nickref()).is_some())
+}
+
+fn spell_highlight(config: &Spellcheck, theme: &Theme) -> Style {
+    let error_color = theme.styles().text.error.color;
+
+    Style {
+        color: Some(config.color.unwrap_or(error_color)),
+        style: Some(match config.style {
+            FontStyle::Normal => iced::font::Style::Normal,
+            FontStyle::Italic => iced::font::Style::Italic,
+            FontStyle::Oblique => iced::font::Style::Oblique,
+        }),
+        underline: config.underline.then_some(Underline::Single),
+        underline_color: Some(config.underline_color.unwrap_or(error_color)),
+        ..Style::default()
+    }
 }
 
 #[cfg(test)]
